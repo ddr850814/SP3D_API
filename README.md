@@ -1,1 +1,2 @@
 设计参数符合寰球设计规定，需要修改的自己改代码里的参数
+ui使用devdotnetbar或telerik 
