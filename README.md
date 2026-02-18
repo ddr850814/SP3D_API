@@ -1,2 +1,2 @@
 设计参数符合寰球设计规定，可在设置文件中修改
-ui使用devdotnetbar或telerik 
+>ui使用devdotnetbar或telerik 
