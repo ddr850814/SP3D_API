@@ -316,7 +316,7 @@ class _ConnDialog(ttk.Toplevel):
 
 def open_filter_dialog(parent, conn_info: dict, plant: dict,
                        plant_name: str = "", last_name: str = ""):
-    """模态过滤器选择；确定返回 (name, oids)，取消返回 None。"""
+    """模态过滤器选择；确定返回 (name, oids, vol_oids, vol_boxes)，取消返回 None。"""
     dlg = _FilterDialog(parent, conn_info, plant, plant_name, last_name)
     parent.wait_window(dlg)
     return dlg.result
@@ -743,13 +743,18 @@ class _FilterDialog(ttk.Toplevel):
                 self._populate(n["children"], it)
                 continue
             label = n["name"]
-            if n["name"] in dup and n["sys_names"]:
-                shown = "、".join(n["sys_names"][:3])
-                more = "…" if len(n["sys_names"]) > 3 else ""
-                label = f"{n['name']}（{shown}{more}）"
+            if n["name"] in dup:
+                shown = (n.get("sys_names") or n.get("vol_names")
+                         or n.get("vol_pnames") or [])
+                if shown:
+                    txt = "、".join(shown[:3])
+                    more = "…" if len(shown) > 3 else ""
+                    label = f"{n['name']}（{txt}{more}）"
             # 图标：📁 文件夹 / 🔍 普通过滤器 / 📝 SQL 过滤器
             label = ("📝 " if n["kind"] == "sql" else "🔍 ") + label
-            if (n["kind"] == "sys" and n["oids"]) or n["kind"] == "sql":
+            if ((n["kind"] == "sys" and n["oids"]) or n["kind"] == "sql"
+                    or (n["kind"] == "vol"
+                        and (n.get("vol_oids") or n.get("vol_boxes")))):
                 it = self.tree.insert(parent_iid, "end", text=label)
                 self._data[it] = n
             else:
@@ -825,10 +830,24 @@ class _FilterDialog(ttk.Toplevel):
                      "返回的对象直接作为统计范围（不经系统树展开）。")
             self.btn_ok.configure(state="normal")
             return
-        names = f["sys_names"]
-        shown = "、".join(names[:8]) or "（无名字记录）"
-        more = f" 等共 {len(names)} 个" if len(names) > 8 else ""
-        self.lbl_detail.configure(text=f"包含系统节点：{shown}{more}")
+        parts = []
+        names = f.get("sys_names") or []
+        if names:
+            shown = "、".join(names[:8])
+            more = f" 等共 {len(names)} 个" if len(names) > 8 else ""
+            parts.append(f"包含系统节点：{shown}{more}")
+        vnames = f.get("vol_names") or []
+        if vnames:
+            vshown = "、".join(vnames[:8])
+            vmore = f" 等共 {len(vnames)} 个" if len(vnames) > 8 else ""
+            parts.append(f"包含体积范围：{vshown}{vmore}")
+        pnames = f.get("vol_pnames") or []
+        if pnames:
+            pshown = "、".join(pnames[:4])
+            pmore = f" 等共 {len(pnames)} 组" if len(pnames) > 4 else ""
+            parts.append(f"包含平面围合范围：{pshown}{pmore}")
+        self.lbl_detail.configure(
+            text="\n".join(parts) or "（条件无引用对象）")
         self.btn_ok.configure(state="normal")
 
     def _exec_sql_filter(self, f: dict):
@@ -885,10 +904,12 @@ class _FilterDialog(ttk.Toplevel):
                     "「%s」的查询没有返回对象。\n"
                     "不设置范围（取消选择）。" % f["name"], parent=self)
                 return
-            self.result = (f["name"], sorted(oids))
+            self.result = (f["name"], sorted(oids), [], [])
             self.destroy()
             return
-        self.result = (f["name"], list(f["oids"]))
+        self.result = (f["name"], list(f["oids"]),
+                       list(f.get("vol_oids") or []),
+                       [list(b) for b in (f.get("vol_boxes") or [])])
         self.destroy()
 
 

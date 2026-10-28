@@ -1,4 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+import sys
+
 from PyInstaller.utils.hooks import collect_submodules
 
 # cryptography 的 x509 等子模块仅被 _rust 扩展运行期动态导入（无静态
@@ -7,11 +10,19 @@ from PyInstaller.utils.hooks import collect_submodules
 _hidden = (['pyodbc', 'oracledb', 'zipfile_deflate64']
            + collect_submodules('cryptography'))
 
+# cryptography 的 _rust.pyd（abi3 轮子）链接稳定 ABI 转发 DLL
+# python3t.dll，PyInstaller 6.22 未自动捆扎（Python 3.15 里该 DLL 在
+# <prefix>\abi3t-compat\ 子目录，超出扫描范围）——干净机器上
+# ImportError: DLL load failed while importing _rust；须显式带入
+_p3t_cands = [os.path.join(sys.base_prefix, 'python3t.dll'),
+              os.path.join(sys.base_prefix, 'abi3t-compat', 'python3t.dll')]
+a_binaries = [(next(p for p in _p3t_cands if os.path.exists(p)), '.')]
+
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=a_binaries,
     datas=[('64.ico', '.')],
     hiddenimports=_hidden,
     hookspath=[],

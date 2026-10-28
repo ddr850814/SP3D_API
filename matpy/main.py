@@ -90,6 +90,8 @@ class App(ttk.Window):
         self.plant = None
         self.sys_names = []
         self.sys_oids = []
+        self.vol_oids = []   # 过滤器 Volume 条件引用的体积对象（材料表交集用）
+        self.vol_boxes = []  # Planes 条件的平面组围合盒 [x0,y0,z0,x1,y1,z1]
         self.dwg_folder_names = []   # ISO 图纸目录勾选（独立于系统过滤器）
         self.dwg_folder_oids = []
         self.groups = []             # 项目材料组列表（焊接量报表，Schema CodelistValueView）
@@ -435,6 +437,8 @@ class App(ttk.Window):
             f = (db.load_spec_mem().get(self._plant_key()) or {}).get("filter") or {}
             self.sys_names = [f["name"]] if f.get("name") else []
             self.sys_oids = [str(o) for o in (f.get("oids") or [])]
+            self.vol_oids = [str(o) for o in (f.get("vol_oids") or [])]
+            self.vol_boxes = [list(map(float, b)) for b in (f.get("vol_boxes") or [])]
             self._set_sys_label()
             self.btn_run.configure(state="normal")
             self._last_rows = None
@@ -444,6 +448,8 @@ class App(ttk.Window):
         f = (self.cfg.get("plant_filters") or {}).get(self._plant_key()) or {}
         self.sys_names = [f["name"]] if f.get("name") else []
         self.sys_oids = [str(o) for o in (f.get("oids") or [])]
+        self.vol_oids = [str(o) for o in (f.get("vol_oids") or [])]
+        self.vol_boxes = [list(map(float, b)) for b in (f.get("vol_boxes") or [])]
         # 恢复该项目记忆的图纸目录勾选
         d = (self.cfg.get("plant_dwg_filters") or {}).get(self._plant_key()) or {}
         self.dwg_folder_names = [str(x) for x in (d.get("names") or [])]
@@ -471,9 +477,16 @@ class App(ttk.Window):
                 self.lbl_sys.configure(text="未选择（全部图纸）", fg="#6b7280")
             return
         self.btn_sys.configure(text="选择过滤器...")
-        if self.sys_names:
+        if self.sys_names or self.vol_oids or self.vol_boxes:
+            parts = []
+            if self.sys_oids:
+                parts.append(f"{len(self.sys_oids)} 个系统节点")
+            n_vol = len(self.vol_oids) + len(self.vol_boxes)
+            if n_vol:
+                parts.append(f"{n_vol} 个体积")
             self.lbl_sys.configure(
-                text=f"过滤器 {self.sys_names[0]}（{len(self.sys_oids)} 个系统节点）",
+                text=f"过滤器 {self.sys_names[0] if self.sys_names else ''}"
+                     f"（{' + '.join(parts)}）",
                 fg="#212529")  # 空串是非法颜色名，须给有效色
         else:
             self.lbl_sys.configure(text="未选择（全部系统）", fg="#6b7280")
@@ -484,7 +497,9 @@ class App(ttk.Window):
         if not isinstance(pf, dict):
             pf = {}
         pf[self._plant_key()] = {"name": self.sys_names[0] if self.sys_names else "",
-                                 "oids": self.sys_oids}
+                                 "oids": self.sys_oids,
+                                 "vol_oids": self.vol_oids,
+                                 "vol_boxes": self.vol_boxes}
         self.cfg["plant_filters"] = pf
         db.save_config(self.cfg)
 
@@ -513,9 +528,11 @@ class App(ttk.Window):
                 plant_name=self.plant["display"] or self.plant["code"],
                 last_name=self.sys_names[0] if self.sys_names else "")
             if result is not None:
-                name, oids = result
+                name, oids, vol_oids, vol_boxes = result
                 self.sys_names = [name] if name else []
                 self.sys_oids = list(oids)
+                self.vol_oids = list(vol_oids)
+                self.vol_boxes = [list(map(float, b)) for b in vol_boxes]
                 self._set_sys_label()
                 self._save_spec_mem()  # 过滤器选择立即按项目落盘（防杀进程丢失）
             return
@@ -540,9 +557,11 @@ class App(ttk.Window):
             plant_name=self.plant["display"] or self.plant["code"],
             last_name=self.sys_names[0] if self.sys_names else "")
         if result is not None:
-            name, oids = result
+            name, oids, vol_oids, vol_boxes = result
             self.sys_names = [name] if name else []
             self.sys_oids = list(oids)
+            self.vol_oids = list(vol_oids)
+            self.vol_boxes = [list(map(float, b)) for b in vol_boxes]
             self._set_sys_label()
             self._mem_filters()
             self._last_rows = None  # 范围变化清缓存
@@ -704,6 +723,7 @@ class App(ttk.Window):
 
     def _stats_key(self):
         return (self._report(), self._plant_key(), tuple(self.sys_oids),
+                tuple(self.vol_oids), tuple(map(tuple, self.vol_boxes)),
                 self._hidden_only())
 
     def _run_stats(self, snapshot: bool = False):
@@ -741,7 +761,9 @@ class App(ttk.Window):
                                    sys_names=list(self.sys_names),
                                    hidden_only=self._hidden_only(),
                                    dwg_folder_oids=list(self.dwg_folder_oids),
-                                   pid_kinds=self._pid_kinds())
+                                   pid_kinds=self._pid_kinds(),
+                                   vol_oids=list(self.vol_oids),
+                                   vol_boxes=[list(b) for b in self.vol_boxes])
         q = self._q
         snap = snapshot and report in snapshots.SPECS
         scope = self._scope_text() if snap else None
@@ -822,6 +844,9 @@ class App(ttk.Window):
     def _scope_text(self) -> str:
         """快照元数据里的范围描述（识别用）。"""
         rng = "；".join(self.sys_names) if self.sys_names else "全部系统"
+        n_vol = len(self.vol_oids) + len(self.vol_boxes)
+        if n_vol:
+            rng += f" ∩ {n_vol} 个体积"
         if self._report() == "焊接量统计":
             parts = ["范围：" + rng,
                      ("不分组", "按材料等级", "按材料组")[self.cmb_met.current()]]
@@ -1209,6 +1234,8 @@ class App(ttk.Window):
             "filter": {
                 "name": self.sys_names[0] if self.sys_names else "",
                 "oids": [str(o) for o in self.sys_oids],
+                "vol_oids": [str(o) for o in self.vol_oids],
+                "vol_boxes": [list(b) for b in self.vol_boxes],
             },
         }
         db.save_spec_mem(mem)
@@ -1385,6 +1412,8 @@ class App(ttk.Window):
             clr=clr, mg=mg, met=self.cmb_met.current(),
             thk=self.chk_thk.get(),
             sys_names=self.sys_names, sys_oids=self.sys_oids,
+            vol_oids=list(self.vol_oids),
+            vol_boxes=[list(b) for b in self.vol_boxes],
             skip_pipes=self.chk_skip_pipes.get())
         self._pending_opts = opts
         # 选项与上次完全一致且上次结果未成功导出 → 直接复用缓存

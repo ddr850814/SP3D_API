@@ -74,6 +74,11 @@ class MatOptions:
     hidden_only: bool = False  # True=仅统计隐藏材料（ReportingRequirements=2）
     dwg_folder_oids: List[str] = field(default_factory=list)  # ISO 图纸目录节点
     pid_kinds: Optional[frozenset] = None  # PID 关联对象类别白名单（None=全部）
+    vol_oids: List[str] = field(default_factory=list)  # 范围 volume 条件引用的
+    # 体积对象 oid（Named Spaces 条件；多体积并集语义：中心命中任一盒即计入）
+    vol_boxes: List[List[float]] = field(default_factory=list)  # Planes 条件的
+    # 平面组围合盒 [xmin,ymin,zmin,xmax,ymax,zmax]（组内全部平面聚合 MIN/MAX
+    # 而来；单平面是零厚度盒，逐平面判定会失真必须聚合；多组间并集）
 
 
 @dataclass
@@ -107,17 +112,79 @@ class MatRow:
 # ------------------------------------------------------------- 材料采集 ----
 
 
-def _scope_sql(db: Db, opts: "MatOptions", run_col: str) -> Tuple[str, str]:
-    """过滤器范围 → (CTE 前缀, AND 条件)。run_col 为 run oid 列引用。"""
-    if not opts.sys_oids:
+_VOL_PT = ("s.xmin + s.xmax BETWEEN 2*v.xmin AND 2*v.xmax "
+           "AND s.ymin + s.ymax BETWEEN 2*v.ymin AND 2*v.ymax "
+           "AND s.zmin + s.zmax BETWEEN 2*v.zmin AND 2*v.zmax")
+
+
+def _fnum(x: float) -> str:
+    """浮点 SQL 字面量：repr 防科学计数法（1e-05 → 0.0001）。"""
+    s = repr(float(x))
+    return s if "e" not in s and "E" not in s else format(float(x), ".10f")
+
+
+def _scope_sql(db: Db, opts: "MatOptions", run_col: str,
+               mdb: str = "", vol_col: str = "",
+               vol_mode: str = "") -> Tuple[str, str]:
+    """过滤器范围 → (CTE 前缀, AND 条件)。run_col 为 run oid 列引用。
+
+    mdb + vol_col 传入时追加 volume 交集，vol_mode 三种口径：
+    ""（默认，材料表）——零件盒中心点落在勾选体积盒（MDB
+    CORESpatialIndex）内才计入；零件无盒子行即未放置，天然排除。
+    "self"（管夹）——对象自身盒中心点（点状盒即自身位置）判定，
+    无盒子保留不过滤（找不到位置不硬丢）。
+    "host"（螺栓/垫片）——经 XGeneratesConnectionItems 借宿主连接
+    （origin，点状盒）的位置判定，宿主无盒子保留不过滤。"""
+    if not opts.sys_oids and not opts.vol_oids and not opts.vol_boxes:
         return "", ""
-    cte = f"""WITH sysScope (oid) AS (
+    ctes: List[str] = []
+    cond = ""
+    if opts.sys_oids:
+        ctes.append(f"""sysScope (oid) AS (
     SELECT h.oid FROM JNamedItem h WHERE h.oid IN ({_oid_list(db, opts.sys_oids)})
     UNION ALL
     SELECT x.oidDestination FROM XSystemHierarchy x JOIN sysScope s ON x.oidOrigin = s.oid
-)
-"""
-    return cte, f" AND {run_col} IN (SELECT oid FROM sysScope)"
+)""")
+        cond += f" AND {run_col} IN (SELECT oid FROM sysScope)"
+    if (opts.vol_oids or opts.vol_boxes) and mdb and vol_col:
+        tbl = _t(db, mdb, "CORESpatialIndex")
+        # volScope 两来源并集：Named 体积盒（oid 逐个）+ Planes 围合盒
+        # （Python 端已聚合的字面量盒，VALUES/dual 双后端）
+        parts = []
+        if opts.vol_oids:
+            parts.append(f"    SELECT v.xmin, v.ymin, v.zmin, v.xmax, v.ymax, v.zmax\n"
+                         f"    FROM {tbl} v WHERE v.oid IN ({_oid_list(db, opts.vol_oids)})")
+        if opts.vol_boxes:
+            is_ora = getattr(db, "provider", "mssql") == "oracle"
+            cols = ("xmin", "ymin", "zmin", "xmax", "ymax", "zmax")
+            rows = []
+            for b in opts.vol_boxes:
+                nums = ", ".join(f"{_fnum(float(x))} AS {c}"
+                                 for x, c in zip(b, cols))
+                rows.append(f"    SELECT {nums} FROM dual" if is_ora
+                            else f"    SELECT {nums}")
+            joiner = "\n    UNION ALL\n" if is_ora else "\n  UNION ALL\n"
+            parts.append("(" + joiner.join(rows) + "\n    )")
+        ctes.append("volScope (xmin, ymin, zmin, xmax, ymax, zmax) AS (\n"
+                    + "\n  UNION ALL\n".join(parts) + "\n)")
+        if vol_mode == "host":
+            # 宿主位置集合（有 = 可判定）；命中 = 宿主点落在任一勾选体积盒
+            pos = (f"SELECT g.OidDestination FROM XGeneratesConnectionItems g "
+                   f"JOIN {tbl} s ON s.oid = g.oidOrigin")
+            hit = f"{pos} JOIN volScope v ON {_VOL_PT}"
+        else:
+            pos = f"SELECT s.oid FROM {tbl} s"
+            hit = f"{pos} JOIN volScope v ON {_VOL_PT}"
+            if vol_mode == "self":
+                pos = f"SELECT oid FROM {tbl}"
+            # 默认模式无盒即未放置，直接 IN 命中集合排除；
+            # self 模式补"无盒保留"分支
+        if vol_mode in ("self", "host"):
+            cond += (f" AND ({vol_col} IN ({hit})"
+                     f" OR {vol_col} NOT IN ({pos}))")
+        else:
+            cond += f" AND {vol_col} IN ({hit})"
+    return "WITH " + ",\n".join(ctes) + "\n", cond
 
 
 def extract_materials(db: Db, plant: dict,
@@ -133,8 +200,10 @@ def extract_materials(db: Db, plant: dict,
     nvl = "NVL" if is_ora else "ISNULL"
     mdb = plant["model"]
 
-    # 范围 CTE（weldpy 同款：勾选节点 + 全部子孙，恒取范围内）
-    scope_cte, scope_cond = _scope_sql(db, opts, "f.oidOrigin")
+    # 范围 CTE（weldpy 同款：勾选节点 + 全部子孙，恒取范围内）；
+    # volume 交集仅材料表生效（vol_col=零件实例，见 _scope_sql 注释）
+    scope_cte, scope_cond = _scope_sql(db, opts, "f.oidOrigin",
+                                       mdb=mdb, vol_col="pp.oid")
 
     # 部件实例 → 目录定义（madeFrom）；PartNumber 两路：管道目录件表
     # 直取 / 命名 def 载体名（PART2DEF 目标仅这两类，分流依据见 skill）
@@ -525,7 +594,9 @@ def extract_bolts(db: Db, plant: dict, opts: MatOptions,
     nvl = "NVL" if is_ora else "ISNULL"
     mdb, cdb = plant["model"], plant["catalog"]
     oid_out = "RAWTOHEX(bs.Oid)" if is_ora else "CONVERT(VARCHAR(36), bs.Oid)"
-    scope_cte, scope_cond = _scope_sql(db, opts, "op.oidOrigin")
+    # volume：借宿主连接点判定（98.5% 有宿主盒，无宿主盒保留）
+    scope_cte, scope_cond = _scope_sql(db, opts, "op.oidOrigin", mdb=mdb,
+                                       vol_col="bs.Oid", vol_mode="host")
     tail, partno_expr, pipe_oid_expr = _implied_tail(db, mdb)
 
     sql = f"""{scope_cte}SELECT {oid_out} AS objOid,
@@ -585,7 +656,9 @@ def extract_gaskets(db: Db, plant: dict, opts: MatOptions,
     oid_out = "RAWTOHEX(gs.Oid)" if is_ora else "CONVERT(VARCHAR(36), gs.Oid)"
     def_out = ("RAWTOHEX(im.OidDestination)" if is_ora
                else "CONVERT(VARCHAR(36), im.OidDestination)")
-    scope_cte, scope_cond = _scope_sql(db, opts, "op.oidOrigin")
+    # volume：借宿主连接点判定（100% 有宿主盒）
+    scope_cte, scope_cond = _scope_sql(db, opts, "op.oidOrigin", mdb=mdb,
+                                       vol_col="gs.Oid", vol_mode="host")
     tail, partno_expr, pipe_oid_expr = _implied_tail(db, mdb)
 
     # 注意：业主采购码所在的 CDB JDProcurementDataInfo 无索引，JOIN 进主
@@ -680,7 +753,9 @@ def extract_clamps(db: Db, plant: dict, opts: MatOptions,
     nvl = "NVL" if is_ora else "ISNULL"
     mdb, cdb = plant["model"], plant["catalog"]
     oid_out = "RAWTOHEX(m.Oid)" if is_ora else "CONVERT(VARCHAR(36), m.Oid)"
-    scope_cte, scope_cond = _scope_sql(db, opts, "op.oidOrigin")
+    # volume：管夹自身盒（1781/1781 点状）判定，无盒保留
+    scope_cte, scope_cond = _scope_sql(db, opts, "op.oidOrigin", mdb=mdb,
+                                       vol_col="m.Oid", vol_mode="self")
     tail, partno_expr, pipe_oid_expr = _implied_tail(db, mdb)
     # run → spec 名（MSSQL 走 RDB 视图；Oracle 视图慢改关系两跳直查，
     # 同 extract_materials——A53D19B6 目标是命名载体，须再经 5280312B
@@ -1959,9 +2034,11 @@ ORDER BY t.Path, t.Document"""
 # CORERelationOrigin（关系 GUID 语义与存储细节见 skill「用户过滤器」）。
 _FILTER_COMPOUND = "38461280-82EC-11D4-9D3E-00104B34EBF6"   # 过滤器/组合节点下行
 _FILTER_HIER = "1E5DA248-2999-11D5-8C51-0010B59403C7"       # 层次条件→引用节点
+_FILTER_HIER_PLANES = "1E5DA245-2999-11D5-8C51-0010B59403C7"  # Planes 体积条件→平面集对象
 _FILTER_FOLDER = "3846127C-82EC-11D4-9D3E-00104B34EBF6"     # 文件夹→过滤器
 _FILTER_FOLDERSUB = "38461284-82EC-11D4-9D3E-00104B34EBF6"  # 文件夹→子文件夹
 _ADAPTER_SYSTEM = "GSCADHierarchyHelper.SystemAdapter"       # 系统层次条件标识
+_ADAPTER_SPACE = "GSCADHierarchyHelper.SpaceAdapter"         # 体积(Volume)条件标识
 
 
 def load_user_filters(db: Db, win_user: Optional[str] = None):
@@ -1971,15 +2048,37 @@ def load_user_filters(db: Db, win_user: Optional[str] = None):
     Windows 用户的「My Filters」（Category 0 且创建者本人），已剥掉
     单一根文件夹壳；win_user 为 None 或查不到时 my_tree 为空。
     节点 {"type": "folder"/"filter", "name", "children"/"kind",
-    "oids", "sys_names"}；kind："sys"=含系统层次条件（oids 为引用的
-    系统节点，可用于统计）；"obj"/"none" 无 oids，界面置灰不可选；
-    "sql"=SQL 过滤器（CMNAPPCPSqlFilter，不在 UserFilter 登记表、
-    经文件夹关系直接挂树；sql_text/sql_result_col 供选择时在 RDB
-    执行，返回对象 oid 直接作为统计范围）。
+    "oids", "sys_names", "vol_oids", "vol_names"}；kind：
+    "sys"=含系统层次条件（oids 为引用的系统节点，可用于统计）；
+    "vol"=仅含体积条件（vol_oids 为引用的体积对象，材料表按体积盒
+    相交统计）；"sys"+vol_oids 非空=两者混合（统计时取交集）；
+    "obj"/"none" 无 oids，界面置灰不可选；"sql"=SQL 过滤器
+    （CMNAPPCPSqlFilter，不在 UserFilter 登记表、经文件夹关系直接挂
+    树；sql_text/sql_result_col 供选择时在 RDB 执行，返回对象 oid
+    直接作为统计范围）。
+    体积条件 = CMNAPPCPNamedSpFilter(SpaceAdapter)，经 _HIER 关系引用
+    体积对象（JNamedItem 有名；盒子在 MDB CORESpatialIndex）。Named
+    Space 条件（CMNAPPCPHierarchyFilter+SpaceAdapter）引用的是体积本
+    身而非其中内容，不支持，仅 Volume 条件按体积处理。
     """
     hier_oids = {str(r[0]) for r in db.query(
         "SELECT oid FROM CMNAPPCPHierarchyFilter "
         f"WHERE bstrAdapterProgID = '{_ADAPTER_SYSTEM}'")}
+    # 体积(Volume)条件两种录入方式（存储结构见 skill）：
+    # Named Spaces → NamedSpFilter(SpaceAdapter) + 1E5DA248 引用空间对象
+    #   （体积盒逐对象进 volScope，多体积并集）；
+    # Planes → RefPlanesFilter（全表即条件，无 ProgID 列）+ 1E5DA245 引用
+    #   平面对象组（ElevPlane/GPX/GPY 等零厚度平面，单平面当盒会失真，
+    #   须组内 MIN/MAX 聚合成围合盒，条件粒度一盒）
+    vol_conds = {str(r[0]) for r in db.query(
+        "SELECT oid FROM CMNAPPCPNamedSpFilter "
+        f"WHERE bstrAdapterProgID = '{_ADAPTER_SPACE}'")}
+    planes_conds: Set[str] = set()
+    try:
+        planes_conds = {str(r[0]) for r in db.query(
+            "SELECT oid FROM CMNAPPCPRefPlanesFilter")}
+    except Exception:
+        pass  # 老库无此表（未见 Planes 条件），忽略
     obj_oids = {str(r[0]) for r in db.query("SELECT oid FROM CMNAPPCPObjTypeFilter")}
     compound: Dict[str, List[str]] = {}
     for o, t in db.query(
@@ -1989,7 +2088,8 @@ def load_user_filters(db: Db, win_user: Optional[str] = None):
     refs: Dict[str, List[str]] = {}
     for o, t in db.query(
             "SELECT oid, oidTarget FROM CORERelationOrigin "
-            f"WHERE RelationType = {_gl(db, _FILTER_HIER)}"):
+            f"WHERE RelationType IN ({_gl(db, _FILTER_HIER)}, "
+            f"{_gl(db, _FILTER_HIER_PLANES)})"):
         refs.setdefault(str(o), []).append(str(t))
     contain: Dict[str, List[str]] = {}
     parent_of: Dict[str, List[str]] = {}
@@ -2022,6 +2122,9 @@ def load_user_filters(db: Db, win_user: Optional[str] = None):
             if not name or name.upper().startswith("SYM_"):
                 continue
             oids: Set[str] = set()
+            vols: Set[str] = set()
+            pboxes: List[List[float]] = []
+            pgroups: List[List[str]] = []
             kind = "none"
             stack, seen = [key], set()
             while stack:
@@ -2032,10 +2135,30 @@ def load_user_filters(db: Db, win_user: Optional[str] = None):
                 if cur in hier_oids:
                     kind = "sys"
                     oids.update(refs.get(cur, []))
+                elif cur in planes_conds:
+                    # Planes 条件：组内平面聚合围合盒（一条件一盒）；
+                    # 名字渲染延后到 filter_node（name_of 彼时才构建）
+                    po = refs.get(cur, [])
+                    if po:
+                        row = db.query(
+                            "SELECT MIN(xmin), MIN(ymin), MIN(zmin), "
+                            "MAX(xmax), MAX(ymax), MAX(zmax) "
+                            f"FROM CORESpatialIndex WHERE oid IN ({_oid_list(db, po)})")
+                        if row and row[0][0] is not None:
+                            pboxes.append([float(x) for x in row[0]])
+                            pgroups.append(po)
+                    if kind == "none":
+                        kind = "vol"
+                elif cur in vol_conds:
+                    vols.update(refs.get(cur, []))
+                    if kind == "none":
+                        kind = "vol"
                 elif cur in obj_oids and kind == "none":
                     kind = "obj"
                 stack.extend(compound.get(cur, []))
-            filters[key] = {"name": name, "kind": kind, "oids": sorted(oids)}
+            filters[key] = {"name": name, "kind": kind, "oids": sorted(oids),
+                            "vol_oids": sorted(vols),
+                            "vol_boxes": pboxes, "vol_pgroups": pgroups}
         # SQL 过滤器（CMNAPPCPSqlFilter）：不在 UserFilter 登记表，自带
         # Name/Category；与 UserFilter 同一 oid 空间，混入 fs 即经现有
         # 文件夹关系（3846127C target 已收录）自动挂树
@@ -2047,6 +2170,7 @@ def load_user_filters(db: Db, win_user: Optional[str] = None):
             if not name or name.upper().startswith("SYM_"):
                 continue
             filters[key] = {"name": name, "kind": "sql", "oids": [],
+                            "vol_oids": [],
                             "sql_text": str(qt or ""),
                             "sql_result_col": str(rc or "")}
         return folders, filters
@@ -2069,15 +2193,25 @@ def load_user_filters(db: Db, win_user: Optional[str] = None):
     for o, n in db.query(
             "SELECT r.oidTarget, j.ItemName FROM "
             "(SELECT DISTINCT oidTarget FROM CORERelationOrigin "
-            f"WHERE RelationType = {_gl(db, _FILTER_HIER)}) r "
+            f"WHERE RelationType IN ({_gl(db, _FILTER_HIER)}, "
+            f"{_gl(db, _FILTER_HIER_PLANES)})) r "
             "LEFT JOIN JNamedItem j ON j.oid = r.oidTarget"):
         name_of[str(o)] = str(n or o)
 
     def filter_node(fs: Dict[str, dict], key: str) -> dict:
         f = fs[key]
+        vo = f.get("vol_oids", [])
+        vb = f.get("vol_boxes") or []
         node = {"type": "filter", "name": f["name"], "kind": f["kind"],
                 "oids": f["oids"],
-                "sys_names": [name_of.get(x, x) for x in f["oids"]]}
+                "sys_names": [name_of.get(x, x) for x in f["oids"]],
+                "vol_oids": vo,
+                "vol_names": [name_of.get(x, x) for x in vo],
+                "vol_boxes": vb,
+                "vol_pnames": ["、".join(name_of.get(x, x[:8])
+                                         for x in g[:4])
+                               + ("…" if len(g) > 4 else "")
+                               for g in f.get("vol_pgroups") or []]}
         if f["kind"] == "sql":
             node["sql_text"] = f["sql_text"]
             node["sql_result_col"] = f["sql_result_col"]

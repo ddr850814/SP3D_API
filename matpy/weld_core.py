@@ -151,6 +151,12 @@ class StatsOptions:
                                                             # 同名系统不止一个，按名字会误收
                                                             # 其他分支，必须按 oid，对齐旧版
                                                             # AddHierarchy 勾选具体节点对象）
+    vol_oids: List[str] = field(default_factory=list)       # 范围体积对象 oid（Volume 过滤器，
+                                                            # 焊口自身点状盒中心点判定，
+                                                            # 无盒保留不过滤）
+    vol_boxes: List[List[float]] = field(default_factory=list)  # Planes 条件平面组
+                                                            # 围合盒（Named 体积之外
+                                                            # 的并集来源，语义同上）
     skip_pipes: bool = False                                # 忽略直管焊缝（勾选后
                                                             # aggregate_pipes 整体跳过，
                                                             # 等价原版规格表全部删行）
@@ -469,7 +475,44 @@ SELECT oid FROM sysScope"""
             return True
         return run_oid is not None and str(run_oid) in scope_oids
 
-    q1_sel = f"""SELECT g.OidOrigin AS conn0, oi.oidOrigin AS partOid, bp.oidDestination AS port0,
+    # 焊口级 volume 过滤（q1 行源过滤，后续归属逻辑零改动）：焊口自身
+    # 盒（点状，中心点即位置）落在任一勾选体积盒内才保留；无盒子保留
+    # 不过滤（找不到位置不硬丢）。与系统范围一样恒取范围内（IN 语义）。
+    vol_cond = ""
+    vol_cte = ""
+    if opts.vol_oids or opts.vol_boxes:
+        si = _t(db, mdb_schema or "", "CORESpatialIndex") if mdb_schema else ""
+        # db 是 RDB 连接，CORESpatialIndex 只在 MDB（RDB 是空壳），
+        # 拿不到 MDB 库名时无法跨库——退化为不过滤并记日志
+        if si:
+            parts = []
+            if opts.vol_oids:
+                parts.append(
+                    f"    SELECT v.xmin, v.ymin, v.zmin, v.xmax, v.ymax, v.zmax\n"
+                    f"    FROM {si} v WHERE v.oid IN ({_oid_list(db, opts.vol_oids)})")
+            if opts.vol_boxes:
+                is_ora = getattr(db, "provider", "mssql") == "oracle"
+                cols = ("xmin", "ymin", "zmin", "xmax", "ymax", "zmax")
+                rows = []
+                for b in opts.vol_boxes:
+                    nums = ", ".join(
+                        f"{repr(float(x)) if 'e' not in repr(float(x)) else format(float(x), '.10f')} AS {c}"
+                        for x, c in zip(b, cols))
+                    rows.append(f"    SELECT {nums} FROM dual" if is_ora
+                                else f"    SELECT {nums}")
+                joiner = "\n    UNION ALL\n" if is_ora else "\n  UNION ALL\n"
+                parts.append("(" + joiner.join(rows) + "\n    )")
+            vol_cte = ("WITH volScope (xmin, ymin, zmin, xmax, ymax, zmax) AS (\n"
+                       + "\n  UNION ALL\n".join(parts) + "\n)\n")
+            vol_cond = (f" AND (w.Oid IN (SELECT s.oid FROM {si} s "
+                        "JOIN volScope v ON s.xmin + s.xmax BETWEEN 2*v.xmin AND 2*v.xmax "
+                        "AND s.ymin + s.ymax BETWEEN 2*v.ymin AND 2*v.ymax "
+                        "AND s.zmin + s.zmax BETWEEN 2*v.zmin AND 2*v.zmax)"
+                        f" OR w.Oid NOT IN (SELECT oid FROM {si}))")
+        else:
+            log("volume 范围未生效：缺少 MDB 库名，无法跨库取空间索引")
+
+    q1_sel = f"""{vol_cte}SELECT g.OidOrigin AS conn0, oi.oidOrigin AS partOid, bp.oidDestination AS port0,
        op.oidOrigin AS run0, wp.PortIndex AS pidx,
        bro.BranchReportingOwnership AS broV,
        CASE WHEN bex.part IS NOT NULL THEN 1 ELSE 0 END AS isBr,
@@ -484,7 +527,7 @@ JOIN XOwnsParts op ON op.oidDestination = oi.oidOrigin
 LEFT JOIN JRteBranchReportingOwnership bro ON bro.Oid = oi.oidOrigin
 LEFT JOIN (SELECT DISTINCT x.OidDestination AS part FROM XPathGeneratedParts x JOIN JRtePipeBranchPathFeat bf ON bf.Oid = x.OidOrigin) bex ON bex.part = oi.oidOrigin
 LEFT JOIN JMTOInfo mto ON mto.Oid = w.Oid
-WHERE {nvl}(mto.ReportingRequirements, 5) <> 2"""
+WHERE {nvl}(mto.ReportingRequirements, 5) <> 2{vol_cond}"""
     q1 = q1_sel
     rows = db.query(q1)
     if not rows:
